@@ -1,5 +1,3 @@
-#!/usr/bin/python
-
 import numpy
 import rospy
 import random
@@ -11,7 +9,23 @@ from tf import transformations as tf
 from interactive_markers.interactive_marker_server import InteractiveMarkerServer
 from robot_model import RobotModel, Joint
 from markers import frame
+from linalg import pinv_svd
 
+def alt_orientation_error(T_tgt: numpy.ndarray, T_cur: numpy.ndarray) -> numpy.ndarray:
+        """Axis–angle orientation error **ω** in the current end‑effector frame.
+
+        Computes R_err = R_curᵀ · R_tgt and extracts θ·w using
+        ``tf.rotation_from_matrix`` as required in Sheet 9.
+        """
+        R_cur = T_cur[0:3, 0:3]
+        R_tgt = T_tgt[0:3, 0:3]
+        R_err = R_cur.T @ R_tgt
+        T_err = numpy.eye(4)
+        T_err[0:3, 0:3] = R_err
+        angle, axis, _ = tf.rotation_from_matrix(T_err)
+        if numpy.isclose(angle, 0.0):
+            return numpy.zeros(3)
+        return angle * numpy.array(axis)
 
 class MyInteractiveMarkerServer(InteractiveMarkerServer):
     """Server handling interactive rviz markers"""
@@ -48,6 +62,17 @@ class MyInteractiveMarkerServer(InteractiveMarkerServer):
             control.orientation.w = 1
             im.controls.append(control)
 
+            # control = InteractiveMarkerControl()
+            # control.name = "rotate_" + dir
+            # control.interaction_mode = InteractiveMarkerControl.ROTATE_AXIS
+            # control.orientation.x = 1 if dir == "x" else 0
+            # control.orientation.y = 1 if dir == "y" else 0
+            # control.orientation.z = 1 if dir == "z" else 0
+            # control.orientation.w = 1
+            # im.controls.append(control)
+        # Create a control to rotate the marker
+
+
         # Add the marker to the server and indicate that processMarkerFeedback should be called
         self.insert(im, self.process_marker_feedback)
 
@@ -61,6 +86,7 @@ class MyInteractiveMarkerServer(InteractiveMarkerServer):
         # Compute target homogenous transform from marker pose
         self.target = tf.quaternion_matrix(numpy.array([q.x, q.y, q.z, q.w]))
         self.target[0:3, 3] = numpy.array([p.x, p.y, p.z])
+
 
 
 class Controller(object):
@@ -86,35 +112,54 @@ class Controller(object):
         self.pub.publish(self.joint_msg)  # publish new joint state
         joints = dict(zip(self.joint_msg.name, self.joint_msg.position))  # turn list of names and joint values into map
         self.T, self.J = self.robot.fk(self.target_link, joints)  # compute new forward kinematics and Jacobian
-
+    
+    
     def solve(self, J, error):
         """Inverse velocity kinematics: q_delta = J^+ * error"""
         return numpy.linalg.pinv(J, 0.01).dot(error)
-
+    
     @staticmethod
     def position_error(T_tgt, T_cur):
-        """Given homogenous transforms of target and current pose, compute error vector"""
-        return T_tgt[0:3, 3]-T_cur[0:3, 3]
+        """Translational error (world frame)"""
+        return T_tgt[0:3, 3] - T_cur[0:3, 3]
+
+    @staticmethod
+    def orientation_error(T_tgt, T_cur):
+        """Compute orientation error
+        ω = θ · w where θ is the rotation angle and w the rotation axis **expressed in the current
+        end‑effector frame**, as required by the exercise sheet (Sheet 9, Task 9.1).
+        """
+        R_tgt = T_tgt[0:3, 0:3]
+        R_cur = T_cur[0:3, 0:3]
+        # Rotation bringing current into target, represented in EE frame.
+        R_err = R_cur.T.dot(R_tgt)           # R_cur⁻¹ · R_tgt
+        # Extend to 4×4 so tf.rotation_from_matrix accepts it
+        R_err_h = numpy.eye(4)
+        R_err_h[0:3, 0:3] = R_err
+        angle, axis, _ = tf.rotation_from_matrix(R_err_h)
+        return angle * numpy.asarray(axis)
+
+    # -------------------- Controllers --------------------
 
     def position_control(self, target):
         v = self.position_error(target, self.T)
         q_delta = self.solve(self.J[0:3, :], v)
         self.actuate(q_delta)
 
-    def lissajous(self, w=0.1*2*numpy.pi, n=2):
-        # Compute offset for Lissajous figure
-        t = rospy.get_time()
-        offset = numpy.asarray([0.3 * numpy.sin(w * t), 0.3 * numpy.sin(n * w * t), 0.])
-        # add offset to current marker pose to draw Lissajous figure in x-y-plane of marker
-        target = numpy.copy(self.im_server.target)
-        target[0:3, 3] += target[0:3, 0:3].dot(offset)
-        self.position_control(target)
+    def pose_control(self, target):
+        """6‑D controller combining translation & orientation"""
+        v = self.position_error(target, self.T)
+        w = self.orientation_error(target, self.T)
+        xi = numpy.hstack((v, w))          # 6‑vector twist error
+        q_delta = self.solve(self.J, xi)   # full 6×n Jacobian
+        self.actuate(q_delta)
 
 
-if __name__ == '__main__':
-    rospy.init_node('ik')  # create a ROS node
+if __name__ == "__main__":
+    rospy.init_node("ik")
     c = Controller()
-    rate = rospy.Rate(50)  # Run control loop at 50 Hz
+    rate = rospy.Rate(50)
     while not rospy.is_shutdown():
-        c.lissajous()
+        c.position_control(c.im_server.target)  # full 6‑D control loop
         rate.sleep()
+    
